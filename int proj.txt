@@ -1,0 +1,19 @@
+1. Detecting and Quantifying Dataset Bias in Autonomous Driving Datasets
+
+Problem Statement:
+Deep learning models used in autonomous driving systems rely on large-scale datasets for training perception tasks such as object detection and scene understanding. However, these datasets may contain hidden biases, for example an overrepresentation of certain conditions such as daytime driving, clear weather, or specific road environments. Such biases can lead to uneven model performance across different real-world scenarios and may affect the reliability and safety of the system. In this project, you are required to analyze a publicly available autonomous driving dataset such as BDD100K dataset, nuScenes dataset, or KITTI Vision Benchmark Suite. You should investigate the presence of dataset bias across factors including weather, lighting, scene type, and object categories, and evaluate how these biases influence the performance of a deep learning perception model. The objective is to quantify performance differences across conditions, identify possible sources of bias, and propose insights or recommendations that could improve fairness and robustness in automotive AI systems.
+
+2. Safety-Critical Object Detection in Autonomous Driving
+
+Problem Statement:
+Not all perception errors in autonomous driving systems have equal consequences. Missing a pedestrian or cyclist can have far more severe implications than misclassifying less critical objects. However, most deep learning models are trained using loss functions that treat all errors equally. In this project, you are required to investigate the concept of safety-critical perception by analyzing how detection errors affect objects with different safety importance levels. Using a dataset such as BDD100K dataset or nuScenes dataset, evaluate model performance separately for safety-critical objects such as pedestrians, cyclists, and vehicles. The goal is to analyze whether current models prioritize these objects effectively and to explore potential evaluation metrics or training strategies that better account for safety-critical scenarios.
+
+3. Spurious Correlation Detection in Driving Models
+
+Problem Statement:
+Deep learning models sometimes rely on unintended correlations in training data rather than meaningful features. For example, a model might associate pedestrians with crosswalk markings rather than recognizing the pedestrian itself. Such spurious correlations can cause failures in unusual environments. In this project, you are required to investigate whether perception models trained on datasets such as BDD100K dataset rely on unintended visual cues. Using explainability techniques such as Grad-CAM or Integrated Gradients, analyze which regions of an image influence the model’s predictions. The objective is to identify potential spurious correlations and evaluate how they affect model reliability across different driving environments.
+
+4. Temporal Consistency in Autonomous Driving Perception
+
+Problem Statement:
+Most perception models for autonomous driving process images frame by frame, even though driving is inherently a temporal task. As a result, predictions may fluctuate across consecutive frames, leading to inconsistent detections and unstable behavior. In this project, you are required to investigate temporal consistency in perception models using sequential driving data from datasets such as nuScenes dataset. Your task is to analyze how object detections change across consecutive frames and quantify inconsistencies in model predictions. The objective is to identify scenarios where temporal instability occurs and explore strategies to improve temporal coherence in perception systems.
