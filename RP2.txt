@@ -1,0 +1,583 @@
+import torch
+import torch.nn as nn
+import torchvision
+import torchvision.transforms as T
+import torchvision.transforms.functional as TF
+from torchvision.datasets import GTSRB
+from torch.utils.data import DataLoader, Subset
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from PIL import Image
+import os, random
+
+# ── Configuration — edit these to match your setup ──────────────────────────
+CFG = dict(
+    model_path    = "/kaggle/input/models/pharvesh/resnet18/pytorch/default/1/gtsrb_resnet18.pth",  # ← path to your trained model
+    image_size    = 32,                # resize all images to this
+    source_class  = 14,                # class we ATTACK  (14 = Stop sign)
+    target_class  = 1,                 # desired wrong prediction (1 = 30 km/h)
+    mask_type     = "rectangle",       # rectangle | circle | border | full
+    mask_ratio    = 0.35,              # fraction of image covered by sticker
+    epsilon       = 0.7,               # max L∞ perturbation per pixel
+    alpha         = 0.01,              # Adam learning rate
+    num_steps     = 500,               # optimisation iterations
+    num_transforms= 10,                # physical transforms sampled per step
+    lambda_tv     = 1e-4,              # smoothness regulariser weight
+    lambda_lp     = 1e-3,              # L2 norm regulariser weight
+    device        = "cuda" if torch.cuda.is_available() else "cpu",
+    seed          = 42,
+)
+
+# Reproducibility
+torch.manual_seed(CFG["seed"])
+np.random.seed(CFG["seed"])
+random.seed(CFG["seed"])
+
+print("✓ Imports done")
+print(f"  Device : {CFG['device']}")
+print(f"  PyTorch: {torch.__version__}")
+
+#%%
+
+GTSRB_CLASSES = [
+    "Speed limit (20km/h)", "Speed limit (30km/h)", "Speed limit (50km/h)",
+    "Speed limit (60km/h)", "Speed limit (70km/h)", "Speed limit (80km/h)",
+    "End of speed limit (80km/h)", "Speed limit (100km/h)", "Speed limit (120km/h)",
+    "No passing", "No passing (>3.5t)", "Right-of-way at intersection",
+    "Priority road", "Yield", "Stop", "No vehicles", "Vehicles >3.5t prohibited",
+    "No entry", "General caution", "Dangerous curve left", "Dangerous curve right",
+    "Double curve", "Bumpy road", "Slippery road", "Road narrows right",
+    "Road work", "Traffic signals", "Pedestrians", "Children crossing",
+    "Bicycles crossing", "Beware of ice/snow", "Wild animals crossing",
+    "End of all restrictions", "Turn right ahead", "Turn left ahead", "Ahead only",
+    "Go straight or right", "Go straight or left", "Keep right", "Keep left",
+    "Roundabout mandatory", "End of no passing", "End of no passing (>3.5t)",
+]
+
+transform = T.Compose([
+    T.Resize((CFG["image_size"], CFG["image_size"])),
+    T.ToTensor(),   # → (C, H, W) float in [0, 1],
+    T.Normalize(mean=[0.3337, 0.3064, 0.3171],
+                std =[0.2672, 0.2564, 0.2629]),  # GTSRB statistics
+])
+
+
+
+
+
+# Download=True will auto-download if not present
+dataset = GTSRB(root="./data", split="test", transform=transform, download=True)
+
+# Filter to source class only
+source_indices = [i for i, (_, label) in enumerate(dataset) if label == CFG["source_class"]]
+print(f"\n✓ Dataset loaded: {len(dataset)} test images total")
+print(f"  Source class {CFG['source_class']}: '{GTSRB_CLASSES[CFG['source_class']]}' → {len(source_indices)} images")
+print(f"  Target class {CFG['target_class']}: '{GTSRB_CLASSES[CFG['target_class']]}'")
+
+#%%
+
+# Find the first correctly classified source image
+MEAN = torch.tensor([0.3337, 0.3064, 0.3171]).view(3, 1, 1)
+STD  = torch.tensor([0.2672, 0.2564, 0.2629]).view(3, 1, 1)
+
+def denorm(t):
+    """Undo normalization for display. t: (C,H,W) normalized tensor → [0,1]"""
+    return (t * STD + MEAN).clamp(0, 1)
+
+def show_images(imgs, titles=None, cols=8, figsize=(14, 3)):
+    rows = max(1, len(imgs) // cols + int(len(imgs) % cols > 0))
+    fig, axes = plt.subplots(rows, cols, figsize=figsize)
+    axes = np.array(axes).flatten()
+    for i, ax in enumerate(axes):
+        if i < len(imgs):
+            img = denorm(imgs[i]).permute(1, 2, 0).clamp(0, 1).numpy()
+            ax.imshow(img)
+            if titles: ax.set_title(titles[i], fontsize=7)
+        ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+# Pick 16 source class images to display
+sample_idx = source_indices[:16]
+sample_imgs = [dataset[i][0] for i in sample_idx]
+
+show_images(
+    sample_imgs,
+    titles=[f"#{i}" for i in sample_idx],
+    figsize=(14, 2.5)
+)
+print(f"Showing 16 samples from class {CFG['source_class']}: '{GTSRB_CLASSES[CFG['source_class']]}'")
+
+#%%
+
+from torchvision.models import resnet18
+model = resnet18(num_classes=43)
+model.load_state_dict(torch.load(CFG["model_path"], map_location=CFG["device"]))
+# ─────────────────────────────────────────────────────────────────────────────
+
+model = model.to(CFG["device"]).eval()
+print("✓ Model loaded and set to eval mode")
+
+# Quick sanity check: classify the source images
+correct = 0
+preds = []
+with torch.no_grad():
+    for img in sample_imgs:
+        logits = model(img.unsqueeze(0).to(CFG["device"]))
+        pred = logits.argmax(1).item()
+        preds.append(pred)
+        correct += int(pred == CFG["source_class"])
+
+print(f"\nBaseline accuracy on {len(sample_imgs)} source images: {correct}/{len(sample_imgs)} ({100*correct/len(sample_imgs):.0f}%)")
+print(f"Predictions: {preds}  (expected all {CFG['source_class']})")
+
+#%%
+
+x_orig = None
+for idx in source_indices:
+    img, label = dataset[idx]
+    with torch.no_grad():
+        pred = model(img.unsqueeze(0).to(CFG["device"])).argmax(1).item()
+    if pred == CFG["source_class"]:
+        x_orig = img   # (C, H, W) in [0, 1]
+        print(f"✓ Selected image index {idx}")
+        print(f"  Model prediction: {pred} → '{GTSRB_CLASSES[pred]}' ✓")
+        break
+
+if x_orig is None:
+    raise RuntimeError("No correctly classified source image found. Check your model.")
+
+# Display it
+fig, ax = plt.subplots(1, 1, figsize=(3, 3))
+ax.imshow(denorm(x_orig).permute(1, 2, 0).numpy())
+ax.set_title(f"Source image\nClass {CFG['source_class']}: {GTSRB_CLASSES[CFG['source_class']]}", fontsize=10)
+ax.axis("off")
+plt.tight_layout()
+plt.show()
+
+print(f"\nImage tensor shape: {x_orig.shape}")
+print(f"Value range: [{x_orig.min():.3f}, {x_orig.max():.3f}]")
+
+#%%
+
+def build_mask(image_size, mask_type="rectangle", mask_ratio=0.35):
+    """
+    Returns a (1, H, W) binary float tensor.
+    White pixels in the mask = where the sticker perturbation lives.
+    """
+    H = W = image_size
+    mask = torch.zeros(1, H, W)
+
+    if mask_type == "full":
+        mask[:] = 1.0
+
+    elif mask_type == "rectangle":
+        h_p = int(H * mask_ratio)
+        w_p = int(W * mask_ratio)
+        r0, c0 = (H - h_p) // 2, (W - w_p) // 2
+        mask[:, r0:r0+h_p, c0:c0+w_p] = 1.0
+
+    elif mask_type == "circle":
+        radius = int(min(H, W) * mask_ratio / 2)
+        cy, cx = H // 2, W // 2
+        for r in range(H):
+            for c in range(W):
+                if (r-cy)**2 + (c-cx)**2 <= radius**2:
+                    mask[0, r, c] = 1.0
+
+    elif mask_type == "border":
+        b = max(1, int(H * mask_ratio / 3))
+        mask[:, :b, :] = 1.0
+        mask[:, -b:, :] = 1.0
+        mask[:, :, :b] = 1.0
+        mask[:, :, -b:] = 1.0
+
+    return mask
+
+
+# Build all 4 mask types for comparison
+mask_types = ["rectangle", "circle", "border", "full"]
+masks = {mt: build_mask(CFG["image_size"], mt, CFG["mask_ratio"]) for mt in mask_types}
+
+fig, axes = plt.subplots(2, 4, figsize=(13, 6))
+img_np = denorm(x_orig).permute(1, 2, 0).numpy()
+
+for col, mt in enumerate(mask_types):
+    m = masks[mt].squeeze(0).numpy()
+    coverage = m.mean() * 100
+
+    # Row 0: the mask itself
+    axes[0, col].imshow(m, cmap="gray", vmin=0, vmax=1)
+    axes[0, col].set_title(f"'{mt}'\n{coverage:.0f}% coverage", fontsize=9)
+    axes[0, col].axis("off")
+
+    # Row 1: mask overlaid on source image (red tint = perturbable)
+    overlay = img_np.copy()
+    overlay[m == 1, 0] = np.clip(overlay[m == 1, 0] * 0.5 + 0.5, 0, 1)  # red tint
+    overlay[m == 1, 1] *= 0.4
+    overlay[m == 1, 2] *= 0.4
+    axes[1, col].imshow(overlay)
+    axes[1, col].set_title("Red = sticker region", fontsize=8)
+    axes[1, col].axis("off")
+
+# Highlight the one we'll use
+axes[0, mask_types.index(CFG["mask_type"])].set_title(
+    f"'{CFG['mask_type']}' ← SELECTED\n{masks[CFG['mask_type']].mean()*100:.0f}% coverage",
+    fontsize=9, color="green", fontweight="bold"
+)
+
+fig.suptitle("Mask types — white region = where sticker perturbation is applied", fontsize=12)
+plt.tight_layout()
+plt.show()
+
+# Use the configured mask going forward
+mask = masks[CFG["mask_type"]].to(CFG["device"])
+print(f"\n✓ Using mask type: '{CFG['mask_type']}' — {mask.mean()*100:.0f}% of pixels are perturbable")
+
+#%%
+
+# ── Cell: Visualise patch placement before training ───────────────────────────
+
+# Custom mask — small rectangle just below the STOP letters
+# On a 32x32 image the sign face roughly occupies the center
+# "Just below STOP text" ≈ vertical range 55-70%, horizontal range 20-80%
+
+def build_custom_mask(image_size=32, row_start=0.65, row_end=0.70,
+                                     col_start=0.20, col_end=0.80):
+    """
+    Build mask using fractional coordinates so it's easy to
+    visually tune — just adjust the fractions and re-run.
+    
+    row_start/end : vertical position (0=top, 1=bottom)
+    col_start/end : horizontal position (0=left, 1=right)
+    """
+    H = W = image_size
+    mask = torch.zeros(1, H, W)
+    r0 = int(H * row_start);  r1 = int(H * row_end)
+    c0 = int(W * col_start);  c1 = int(W * col_end)
+    mask[:, r0:r1, c0:c1] = 1.0
+    print(f"Mask pixel region: rows {r0}–{r1}, cols {c0}–{c1}  "
+          f"({r1-r0}×{c1-c0} pixels = {(r1-r0)*(c1-c0)} px total, "
+          f"{mask.mean()*100:.1f}% of image)")
+    return mask, (r0, r1, c0, c1)
+
+
+# ── Tune these four numbers to move/resize the patch ─────────────────────────
+PATCH_CFG = dict(
+    row_start = 0.68,   # ↕ top edge of patch
+    row_end   = 0.73,   # ↕ bottom edge of patch
+    col_start = 0.30,   # ↔ left edge of patch
+    col_end   = 0.80,   # ↔ right edge of patch
+)
+
+mask_custom, (r0, r1, c0, c1) = build_custom_mask(CFG["image_size"], **PATCH_CFG)
+
+# ── Visualise on several stop sign images ─────────────────────────────────────
+import matplotlib.patches as mpatches
+
+n_show = 6
+fig, axes = plt.subplots(1, n_show, figsize=(14, 3))
+fig.suptitle("Patch placement preview — red box = sticker region", 
+             fontsize=11, fontweight="bold")
+
+for ax, idx in zip(axes, source_indices[:n_show]):
+    img, _ = dataset[idx]
+    img_disp = denorm(img).permute(1, 2, 0).numpy()
+    
+    # Upscale for visibility (32x32 is tiny)
+    scale = 6
+    img_up = np.repeat(np.repeat(img_disp, scale, axis=0), scale, axis=1)
+    ax.imshow(img_up)
+    
+    # Draw patch rectangle (scaled)
+    rect = mpatches.Rectangle(
+        (c0 * scale, r0 * scale),          # (x, y) = (col, row)
+        (c1 - c0) * scale,                 # width
+        (r1 - r0) * scale,                 # height
+        linewidth=2, edgecolor="red",
+        facecolor="red", alpha=0.3
+    )
+    ax.add_patch(rect)
+    ax.set_title(f"#{idx}", fontsize=8)
+    ax.axis("off")
+
+plt.tight_layout()
+plt.show()
+
+print("\nHappy with the placement? Adjust PATCH_CFG and re-run to fine-tune.")
+print("When satisfied, run the next cell to start training.")
+
+#%%
+
+import torch.nn.functional as F
+
+class PhysicalTransformSampler:
+    """
+    All ops are pure PyTorch — autograd graph stays intact so
+    gradients flow all the way back to delta.
+    """
+    def __init__(
+        self,
+        angle_range      = (-15, 15),
+        scale_range      = (0.8, 1.2),
+        brightness_range = (0.7, 1.3),
+        contrast_range   = (0.8, 1.2),
+        noise_std        = 0.02,
+    ):
+        self.angle_range      = angle_range
+        self.scale_range      = scale_range
+        self.brightness_range = brightness_range
+        self.contrast_range   = contrast_range
+        self.noise_std        = noise_std
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (C,H,W) normalised tensor — returns transformed (C,H,W), graph intact."""
+
+        x = x.unsqueeze(0)   # (1,C,H,W) for grid_sample
+
+        # 1. Rotation + scale via affine grid (fully differentiable)
+        angle = np.random.uniform(*self.angle_range)
+        scale = np.random.uniform(*self.scale_range)
+        rad   = torch.tensor(angle * np.pi / 180.0, dtype=torch.float32)
+        cos_a, sin_a = torch.cos(rad), torch.sin(rad)
+
+        # 2×3 affine matrix: rotation + scale combined
+        theta = torch.tensor([[
+            [cos_a / scale, -sin_a / scale, 0.0],
+            [sin_a / scale,  cos_a / scale, 0.0],
+        ]], dtype=torch.float32, device=x.device)
+
+        grid = F.affine_grid(theta, x.shape, align_corners=False)
+        x    = F.grid_sample(x, grid, align_corners=False, padding_mode="border")
+
+        x = x.squeeze(0)   # back to (C,H,W)
+
+        # 2. Brightness (multiplicative — differentiable)
+        brightness = np.random.uniform(*self.brightness_range)
+        x = x * brightness
+
+        # 3. Contrast (differentiable)
+        contrast = np.random.uniform(*self.contrast_range)
+        mean = x.mean(dim=(1, 2), keepdim=True)
+        x    = (x - mean) * contrast + mean
+
+        # 4. Gaussian noise (differentiable — adds to graph but gradient passes through)
+        x = x + torch.randn_like(x) * self.noise_std
+
+        return x   # stays normalised — no re-normalize needed
+
+sampler = PhysicalTransformSampler()
+
+# --- Visualise 12 random transforms of our chosen image ---
+n_show = 12
+transformed = [sampler(denorm(x_orig)) for _ in range(n_show)]
+
+fig, axes = plt.subplots(2, 7, figsize=(14, 4))
+# First cell = original
+axes[0, 0].imshow(denorm(x_orig).permute(1, 2, 0).numpy())
+axes[0, 0].set_title("Original", fontsize=8, fontweight="bold")
+axes[0, 0].axis("off")
+axes[1, 0].axis("off")
+
+for i, t in enumerate(transformed):
+    r, c = divmod(i, 6)
+    ax = axes[r, c + 1]
+    ax.imshow(t.permute(1, 2, 0).numpy())
+    ax.set_title(f"Sample {i+1}", fontsize=7)
+    ax.axis("off")
+
+fig.suptitle(
+    "Physical transform samples — the attack optimises δ to fool the model across ALL of these",
+    fontsize=11
+)
+plt.tight_layout()
+plt.show()
+
+print(f"✓ Each optimisation step averages loss over {CFG['num_transforms']} such random transforms")
+
+#%%
+
+x = x_orig.to(CFG["device"])          # clean image on device
+target = torch.tensor([CFG["target_class"]], device=CFG["device"])
+
+# ── δ: the adversarial perturbation we will optimise ─────────────────────────
+# Initialise with small random noise INSIDE the mask only.
+# Starting from zero also works but small noise gives Adam a better starting signal.
+delta = (torch.rand_like(x) * 2 - 1) * 0.01 * mask
+delta = delta.detach().requires_grad_(True)
+
+optimizer = torch.optim.Adam([delta], lr=CFG["alpha"])
+criterion = nn.CrossEntropyLoss()
+
+# ── Helper functions ──────────────────────────────────────────────────────────
+
+
+def apply_perturbation(x, delta):
+    return x + mask * delta
+
+def tv_loss(delta):
+    """Total-variation: penalises abrupt pixel-to-pixel changes in δ."""
+    diff_h = (delta[:, 1:, :] - delta[:, :-1, :]).abs().mean()
+    diff_w = (delta[:, :, 1:] - delta[:, :, :-1]).abs().mean()
+    return diff_h + diff_w
+
+
+def project(delta):
+    return delta.clamp(-CFG["epsilon"], CFG["epsilon"]) * mask
+
+print("✓ Optimisation components ready")
+print(f"  δ shape : {delta.shape}")
+print(f"  ε (L∞)  : {CFG['epsilon']}")
+print(f"  Steps   : {CFG['num_steps']}")
+print(f"  Transforms/step: {CFG['num_transforms']}")
+print(f"  λ_tv    : {CFG['lambda_tv']}   λ_lp : {CFG['lambda_lp']}")
+
+#%%
+
+MEAN = torch.tensor([0.3337, 0.3064, 0.3171]).view(3,1,1).to(CFG["device"])
+STD  = torch.tensor([0.2672, 0.2564, 0.2629]).view(3,1,1).to(CFG["device"])
+
+x = x_orig.to(CFG["device"])
+target = torch.tensor([CFG["target_class"]], device=CFG["device"])
+
+# δ lives in NORMALISED space — same space as x
+delta = (torch.rand_like(x) * 2 - 1) * 0.01 * mask
+delta = delta.detach().requires_grad_(True)
+
+optimizer = torch.optim.Adam([delta], lr=CFG["alpha"])
+criterion = nn.CrossEntropyLoss()
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def apply_perturbation(x, delta):
+    # NO clamp here — x is normalised, values live in ~[-1, 3]
+    # Clamping to [0,1] would destroy most of the image
+    return x + mask * delta
+
+def tv_loss(delta):
+    # delta is (C, H, W) — index along H and W dims
+    diff_h = (delta[:, 1:, :] - delta[:, :-1, :]).abs().mean()
+    diff_w = (delta[:, :, 1:] - delta[:, :, :-1]).abs().mean()
+    return diff_h + diff_w
+
+def project(delta):
+    # Only constrain delta itself — NOT the full image
+    return delta.clamp(-CFG["epsilon"], CFG["epsilon"]) * mask
+
+print("✓ Cell 8 ready")
+print(f"  x range     : [{x.min():.3f}, {x.max():.3f}]  (normalised — expected ~[-1, 3])")
+print(f"  delta range : [{delta.min():.4f}, {delta.max():.4f}]  (tiny init noise)")
+print(f"  ε budget    : ±{CFG['epsilon']}")
+
+#%%
+
+all_source_imgs = []
+for idx in source_indices:
+    img, _ = dataset[idx]
+    all_source_imgs.append(img.to(CFG["device"]))
+
+print(f"Optimising over ALL {len(all_source_imgs)} stop sign images, {CFG['num_transforms']} transforms each")
+print(f"Samples per step: {len(all_source_imgs)} images × {CFG['num_transforms']} transforms = {len(all_source_imgs)*CFG['num_transforms']}\n")
+
+
+delta_univ = (torch.rand_like(all_source_imgs[0]) * 2 - 1) * 0.01 * mask
+delta_univ = delta_univ.detach().requires_grad_(True)
+
+optimizer_univ = torch.optim.Adam([delta_univ], lr=CFG["alpha"])
+loss_history_univ = []
+
+print(f"{'Step':>6}  {'Total Loss':>11}  {'CE Loss':>9}  {'ASR (no transform)':>20}")
+print("-" * 55)
+
+for step in range(CFG["num_steps"]):
+    optimizer_univ.zero_grad()
+
+    total_cls_loss = torch.tensor(0.0, device=CFG["device"])
+    n_samples = 0
+
+    # ── Full batch: every image × every transform ─────────────────────────
+    for x_i in all_source_imgs:
+        for _ in range(CFG["num_transforms"]):
+            x_adv       = x_i + mask * delta_univ
+            x_t         = sampler(x_adv)
+            total_cls_loss += criterion(model(x_t.unsqueeze(0)), target)
+            n_samples   += 1
+
+    cls_loss    = total_cls_loss / n_samples       # average over all samples
+    loss_tv     = tv_loss(mask * delta_univ)
+    loss_lp     = (mask * delta_univ).norm(p=2)
+    loss        = cls_loss + CFG["lambda_tv"] * loss_tv + CFG["lambda_lp"] * loss_lp
+
+    loss.backward()
+    optimizer_univ.step()
+
+    with torch.no_grad():
+        delta_univ.data = delta_univ.data.clamp(-CFG["epsilon"], CFG["epsilon"]) * mask
+
+    loss_history_univ.append(loss.item())
+
+    # ── Log: ASR across all images (clean, no transform) ─────────────────
+    if (step + 1) % 20 == 0 or step == 0:
+        with torch.no_grad():
+            hits = sum(
+                int(model((x_i + mask * delta_univ).unsqueeze(0)).argmax(1).item() == CFG["target_class"])
+                for x_i in all_source_imgs
+            )
+        asr = hits / len(all_source_imgs)
+        print(f"{step+1:>6}  {loss.item():>11.4f}  {cls_loss.item():>9.4f}  {asr:>19.0%}  {'✓' if asr==1.0 else ''}")
+
+print("\n✓ Universal patch optimisation complete!")
+
+#%%
+
+with torch.no_grad():
+    x_adv   = apply_perturbation(x, delta).cpu()   # final adversarial image
+    delta_np = delta.cpu()                          # raw perturbation
+
+# Get final prediction
+with torch.no_grad():
+    logits = model(x_adv.unsqueeze(0).to(CFG["device"]))
+    probs  = torch.softmax(logits, dim=1)[0].cpu()
+    pred   = probs.argmax().item()
+    conf   = probs[pred].item()
+
+def t2np(t):
+    return t.cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+
+orig_np  = t2np(denorm(x_orig.cuda()))
+adv_np   = t2np(denorm(x_adv.cuda()))
+pert_amp = t2np((delta_np * 5 + 0.5).clamp(0, 1))        # amplified ×5
+sticker  = t2np((mask.cpu() * delta_np * 5 + 0.5).clamp(0, 1))  # masked only
+
+fig, axes = plt.subplots(1, 5, figsize=(16, 3.5))
+fig.suptitle("RP2 Sticker Attack — Final Result", fontsize=13, fontweight="bold")
+
+axes[0].imshow(orig_np)
+axes[0].set_title(f"Original\n'{GTSRB_CLASSES[CFG['source_class']]}'", fontsize=9)
+
+axes[1].imshow(mask.cpu().squeeze(0).numpy(), cmap="gray")
+axes[1].set_title(f"Mask\n({CFG['mask_type']})", fontsize=9)
+
+axes[2].imshow(pert_amp)
+axes[2].set_title("Perturbation δ\n(amplified ×5)", fontsize=9)
+
+axes[3].imshow(sticker)
+axes[3].set_title("Sticker only\n(M ⊙ δ amplified)", fontsize=9)
+
+success = pred == CFG["target_class"]
+axes[4].imshow(adv_np)
+axes[4].set_title(
+    f"Adversarial\nPred: '{GTSRB_CLASSES[pred]}'\nConf: {conf:.1%}  {'✓' if success else '✗'}",
+    fontsize=9,
+    color="green" if success else "red"
+)
+
+for ax in axes:
+    ax.axis("off")
+
+plt.tight_layout()
+plt.savefig("rp2_result.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("\n✓ Saved to rp2_result.png")
