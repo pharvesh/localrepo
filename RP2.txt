@@ -581,3 +581,279 @@ plt.tight_layout()
 plt.savefig("rp2_result.png", dpi=150, bbox_inches="tight")
 plt.show()
 print("\n✓ Saved to rp2_result.png")
+
+
+
+
+
+
+
+
+#%%
+
+# ── MAX_L2 sweep on extra-small mask ─────────────────────────────────────────
+
+max_l2_values = [8.0, 12.0, 16.0, 20.0]
+sweep_results_xs = {}
+
+for max_l2 in max_l2_values:
+    print(f"\nTraining extra-small | MAX_L2={max_l2} ...")
+
+    d   = (torch.rand_like(all_source_imgs[0]) * 2 - 1) * 0.05 * mask_xs
+    d   = d.detach().requires_grad_(True)
+    opt = torch.optim.Adam([d], lr=0.01)
+
+    for step in range(500):
+        opt.zero_grad()
+        total_loss = torch.tensor(0.0, device=CFG["device"])
+        n = 0
+        for x_i in all_source_imgs:
+            for _ in range(CFG["num_transforms"]):
+                x_t = sampler(x_i + mask_xs * d)
+                total_loss += criterion(model(x_t.unsqueeze(0)), target)
+                n += 1
+        loss  = total_loss / n
+        loss += lambda_tv * tv_loss(mask_xs * d)
+        loss += lambda_lp * (mask_xs * d).norm(p=2)
+        loss.backward()
+        opt.step()
+        with torch.no_grad():
+            d.data = project_l2(d.data, mask_xs, max_l2=max_l2)
+
+        if (step + 1) % 100 == 0:
+            with torch.no_grad():
+                hits = sum(
+                    int(model((x_i + mask_xs * d).unsqueeze(0)
+                        ).argmax(1).item() == CFG["target_class"])
+                    for x_i in all_source_imgs
+                )
+            print(f"  step {step+1} | ASR={hits/len(all_source_imgs):.0%} | "
+                  f"L2={(mask_xs * d).norm(p=2).item():.2f}")
+
+    # Final evaluation
+    with torch.no_grad():
+        clean_hits = sum(
+            int(model((x_i + mask_xs * d).unsqueeze(0)
+                ).argmax(1).item() == CFG["target_class"])
+            for x_i in all_source_imgs
+        )
+        robust_hits, robust_total = 0, 0
+        for x_i in all_source_imgs:
+            for _ in range(10):
+                x_t = sampler(x_i + mask_xs * d)
+                robust_hits  += int(model(x_t.unsqueeze(0)).argmax(1).item() == CFG["target_class"])
+                robust_total += 1
+
+    clean_asr  = clean_hits / len(all_source_imgs)
+    robust_asr = robust_hits / robust_total
+    max_shift  = (mask_xs * d).abs().max().item()
+
+    sweep_results_xs[max_l2] = dict(
+        d          = d.detach().clone(),
+        clean_asr  = clean_asr,
+        robust_asr = robust_asr,
+        max_shift  = max_shift,
+    )
+    print(f"  DONE | clean={clean_asr:.0%} | robust={robust_asr:.0%} | "
+          f"max_shift={max_shift:.3f} | pixels={int(mask_xs.sum())}")
+
+# ── Summary table — all mask sizes together ───────────────────────────────────
+print(f"\n{'='*70}")
+print(f"  Full comparison — all mask sizes")
+print(f"{'='*70}")
+print(f"  {'Mask':>15}  {'Pixels':>7}  {'MAX_L2':>7}  {'Clean':>7}  {'Robust':>8}")
+print(f"  {'-'*55}")
+
+# Reference results from earlier
+print(f"  {'Medium':>15}  {'230':>7}  {'8.0':>7}  {'~93%':>7}  {'~90%':>8}")
+print(f"  {'Small':>15}  {'161':>7}  {'8.0':>7}  {'~83%':>7}  {'~80%':>8}")
+print(f"  {'-'*55}")
+for max_l2, r in sweep_results_xs.items():
+    print(f"  {'Extra-small':>15}  {int(mask_xs.sum()):>7}  {max_l2:>7.1f}  "
+          f"{r['clean_asr']:>7.0%}  {r['robust_asr']:>8.0%}")
+
+# ── Visualise patches at different L2 budgets ─────────────────────────────────
+fig, axes = plt.subplots(2, len(max_l2_values), figsize=(14, 6))
+fig.suptitle(f"Extra-small mask ({int(mask_xs.sum())} px, {mask_xs.mean()*100:.1f}%) "
+             f"— patch appearance vs MAX_L2",
+             fontsize=11, fontweight="bold")
+
+with torch.no_grad():
+    for col, (max_l2, r) in enumerate(sweep_results_xs.items()):
+        # Row 0: patch appearance
+        patch_vis = denorm(mask_xs.cpu() * r["d"].cpu() * 3 + 0.5).squeeze()
+        axes[0, col].imshow(np.repeat(np.repeat(
+            patch_vis.permute(1,2,0).numpy(), 6, 0), 6, 1))
+        axes[0, col].set_title(
+            f"MAX_L2={max_l2}\nclean={r['clean_asr']:.0%} robust={r['robust_asr']:.0%}",
+            fontsize=8)
+        axes[0, col].axis("off")
+
+        # Row 1: patch on real stop sign
+        img, _ = dataset[source_indices[0]]
+        img    = img.to(CFG["device"])
+        x_adv  = img + mask_xs * r["d"].to(CFG["device"])
+        pred   = model(x_adv.unsqueeze(0)).argmax(1).item()
+        axes[1, col].imshow(np.repeat(np.repeat(
+            denorm(x_adv).permute(1,2,0).numpy(), 6, 0), 6, 1))
+        axes[1, col].set_title(
+            f"pred={GTSRB_CLASSES[pred][:12]}\n{'✓' if pred==CFG['target_class'] else '✗'}",
+            fontsize=8,
+            color="green" if pred==CFG["target_class"] else "red"
+        )
+        axes[1, col].axis("off")
+
+plt.tight_layout()
+plt.show()
+
+# Save all
+os.makedirs("./patches", exist_ok=True)
+for max_l2, r in sweep_results_xs.items():
+    torch.save({
+        "delta"       : r["d"].cpu(),
+        "mask"        : mask_xs.cpu(),
+        "MAX_L2"      : max_l2,
+        "clean_asr"   : r["clean_asr"],
+        "robust_asr"  : r["robust_asr"],
+        "source_class": CFG["source_class"],
+        "target_class": CFG["target_class"],
+    }, f"./patches/rp2_xs_maxl2_{int(max_l2)}.pt")
+
+print("\n✓ All extra-small patches saved")
+
+
+
+
+
+
+
+
+# ── Visualise small patch attack ──────────────────────────────────────────────
+
+scale = 6
+
+# ── Panel 1: The patch itself ─────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+fig.suptitle("Universal adversarial patch — small mask", fontsize=11, fontweight="bold")
+
+patch_vis = denorm(mask_small.cpu() * delta_small.detach().cpu() * 3 + 0.5).squeeze()
+axes[0].imshow(np.repeat(np.repeat(patch_vis.permute(1,2,0).numpy(), scale, 0), scale, 1))
+axes[0].set_title("Learned patch δ\n(amplified ×3)", fontsize=9)
+axes[0].axis("off")
+
+axes[1].imshow(np.repeat(np.repeat(
+    mask_small.cpu().squeeze(0).numpy(), scale, 0), scale, 1), cmap="gray")
+axes[1].set_title(f"Mask region\n(16% coverage)", fontsize=9)
+axes[1].axis("off")
+
+delta_vals = (mask_small.cpu() * delta_small.detach().cpu())
+delta_vals = delta_vals[delta_vals != 0].numpy().flatten()
+axes[2].hist(delta_vals, bins=40, color="steelblue", alpha=0.8, edgecolor="white")
+axes[2].axvline(0, color="red", ls="--", lw=1.5, label="zero (no change)")
+axes[2].set_title("Patch value distribution", fontsize=9)
+axes[2].set_xlabel("δ value"); axes[2].set_ylabel("count")
+axes[2].legend(fontsize=8); axes[2].grid(alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# ── Panel 2: Original vs adversarial on 8 images ─────────────────────────────
+n_show = 8
+fig, axes = plt.subplots(2, n_show, figsize=(16, 5))
+fig.suptitle("Original (top) vs adversarial with small universal patch (bottom)",
+             fontsize=11, fontweight="bold")
+
+with torch.no_grad():
+    for col, idx in enumerate(source_indices[:n_show]):
+        img, _ = dataset[idx]
+        img    = img.to(CFG["device"])
+
+        axes[0, col].imshow(np.repeat(np.repeat(
+            denorm(img).permute(1,2,0).numpy(), scale, 0), scale, 1))
+        axes[0, col].set_title(f"Stop sign\n#{idx}", fontsize=7)
+        axes[0, col].axis("off")
+
+        x_adv = img + mask_small * delta_small
+        pred  = model(x_adv.unsqueeze(0)).argmax(1).item()
+        conf  = torch.softmax(model(x_adv.unsqueeze(0)), dim=1)[0][CFG["target_class"]].item()
+        axes[1, col].imshow(np.repeat(np.repeat(
+            denorm(x_adv).permute(1,2,0).numpy(), scale, 0), scale, 1))
+        axes[1, col].set_title(
+            f"{GTSRB_CLASSES[pred][:15]}\nconf={conf:.0%} {'✓' if pred==CFG['target_class'] else '✗'}",
+            fontsize=7,
+            color="green" if pred==CFG["target_class"] else "red"
+        )
+        axes[1, col].axis("off")
+
+plt.tight_layout()
+plt.show()
+
+# ── Panel 3: Robustness under transforms ─────────────────────────────────────
+n_imgs, n_samples = 3, 5
+fig, axes = plt.subplots(n_imgs, n_samples + 1, figsize=(14, 7))
+fig.suptitle("Small patch robustness — adversarial image under random physical transforms",
+             fontsize=11, fontweight="bold")
+
+with torch.no_grad():
+    for row, idx in enumerate(source_indices[:n_imgs]):
+        img, _ = dataset[idx]
+        img    = img.to(CFG["device"])
+        x_adv  = img + mask_small * delta_small
+
+        axes[row, 0].imshow(np.repeat(np.repeat(
+            denorm(x_adv).permute(1,2,0).numpy(), scale, 0), scale, 1))
+        axes[row, 0].set_title("Patched\n(no transform)", fontsize=7, fontweight="bold")
+        axes[row, 0].axis("off")
+
+        for t in range(n_samples):
+            x_t  = sampler(x_adv)
+            pred = model(x_t.unsqueeze(0)).argmax(1).item()
+            conf = torch.softmax(model(x_t.unsqueeze(0)), dim=1)[0][CFG["target_class"]].item()
+            axes[row, t+1].imshow(np.repeat(np.repeat(
+                denorm(x_t).permute(1,2,0).numpy(), scale, 0), scale, 1))
+            axes[row, t+1].set_title(
+                f"T{t+1}: pred={pred}\n{'✓' if pred==CFG['target_class'] else '✗'} {conf:.0%}",
+                fontsize=7,
+                color="green" if pred==CFG["target_class"] else "red"
+            )
+            axes[row, t+1].axis("off")
+
+plt.tight_layout()
+plt.show()
+
+# ── Panel 4: Small vs Medium side-by-side comparison ─────────────────────────
+fig, axes = plt.subplots(2, 4, figsize=(12, 6))
+fig.suptitle("Small vs Medium patch — direct comparison on same images",
+             fontsize=11, fontweight="bold")
+
+with torch.no_grad():
+    for col, idx in enumerate(source_indices[:4]):
+        img, _ = dataset[idx]
+        img    = img.to(CFG["device"])
+
+        # Row 0: small patch
+        x_adv_s = img + mask_small * delta_small
+        pred_s   = model(x_adv_s.unsqueeze(0)).argmax(1).item()
+        axes[0, col].imshow(np.repeat(np.repeat(
+            denorm(x_adv_s).permute(1,2,0).numpy(), scale, 0), scale, 1))
+        axes[0, col].set_title(
+            f"Small | pred={pred_s} {'✓' if pred_s==CFG['target_class'] else '✗'}",
+            fontsize=7, color="green" if pred_s==CFG["target_class"] else "red"
+        )
+        axes[0, col].axis("off")
+
+        # Row 1: medium patch
+        x_adv_m = img + mask_final * delta_final
+        pred_m   = model(x_adv_m.unsqueeze(0)).argmax(1).item()
+        axes[1, col].imshow(np.repeat(np.repeat(
+            denorm(x_adv_m).permute(1,2,0).numpy(), scale, 0), scale, 1))
+        axes[1, col].set_title(
+            f"Medium | pred={pred_m} {'✓' if pred_m==CFG['target_class'] else '✗'}",
+            fontsize=7, color="green" if pred_m==CFG["target_class"] else "red"
+        )
+        axes[1, col].axis("off")
+
+plt.tight_layout()
+plt.show()
+
+
